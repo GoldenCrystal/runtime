@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System;
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -12,8 +13,9 @@ using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Threading;
-
+using Microsoft.Win32.SafeHandles;
 using static Interop.Advapi32;
+using static Interop.User32;
 
 namespace System.ServiceProcess
 {
@@ -36,6 +38,7 @@ namespace System.ServiceProcess
         private bool _disposed;
         private bool _initialized;
         private EventLog? _eventLog;
+        private ConcurrentDictionary<IntPtr, DeviceFileNotificationRegistration>? _fileHandleToRegistrationMappings; // Keep a mapping from device file HANDLE values to .net registration objects.
 
         /// <devdoc>
         ///    <para>
@@ -401,6 +404,44 @@ namespace System.ServiceProcess
         {
         }
 
+        /// <devdoc>
+        ///    <para>When implemented in a derived class,
+        ///    executes when a device notification is received.</para>
+        /// </devdoc>
+        [EditorBrowsable(EditorBrowsableState.Advanced)]
+        protected virtual void OnDeviceNotification(DeviceBroadcastType eventType, SafeFileHandle handle, object? userToken)
+        {
+        }
+
+        /// <devdoc>
+        ///    <para>When implemented in a derived class,
+        ///    executes when a device notification is received.</para>
+        /// </devdoc>
+        [EditorBrowsable(EditorBrowsableState.Advanced)]
+        protected virtual void OnDeviceNotification(DeviceBroadcastType eventType, Guid interfaceClassGuid, string? deviceName)
+        {
+        }
+
+        /// <devdoc>
+        ///    <para> When implemented in a derived class,
+        ///    executes when a device is about to be removed.</para>
+        /// </devdoc>
+        [EditorBrowsable(EditorBrowsableState.Advanced)]
+        protected virtual bool OnDeviceQueryRemove(SafeFileHandle handle, object? userToken)
+        {
+            return true;
+        }
+
+        /// <devdoc>
+        ///    <para> When implemented in a derived class,
+        ///    executes when a device is about to be removed.</para>
+        /// </devdoc>
+        [EditorBrowsable(EditorBrowsableState.Advanced)]
+        protected virtual bool OnDeviceQueryRemove(Guid interfaceClassGuid, string? deviceName)
+        {
+            return true;
+        }
+
         private unsafe void DeferredContinue()
         {
             fixed (SERVICE_STATUS* pStatus = &_status)
@@ -485,6 +526,94 @@ namespace System.ServiceProcess
             catch (Exception e)
             {
                 WriteLogEntry(SR.Format(SR.PowerEventFailed, e), EventLogEntryType.Error);
+
+                // We rethrow the exception so that advapi32 code can report
+                // ERROR_EXCEPTION_IN_SERVICE as it would for native services.
+                throw;
+            }
+        }
+
+        private unsafe int ImmediateDeviceEvent(int eventType, IntPtr eventData)
+        {
+            switch (((DEV_BROADCAST_HDR*)eventData)->dbch_devicetype)
+            {
+                case DBT_DEVTYP_DEVICEINTERFACE:
+                    var broadcastDevInterface = (DEV_BROADCAST_DEVICEINTERFACE*)eventData;
+                    string? deviceName = null;
+
+                    if (broadcastDevInterface->dbcc_size > sizeof(DEV_BROADCAST_DEVICEINTERFACE))
+                    {
+                        int extraLength = broadcastDevInterface->dbcc_size - sizeof(DEV_BROADCAST_DEVICEINTERFACE);
+
+                        var nameSpan = new ReadOnlySpan<char>((byte*)eventData + sizeof(DEV_BROADCAST_DEVICEINTERFACE), extraLength);
+                        int endIndex = nameSpan.IndexOf('\0');
+                        if (endIndex >= 0)
+                        {
+                            nameSpan = nameSpan.Slice(0, endIndex);
+                        }
+                        deviceName = nameSpan.ToString();
+                    }
+
+                    if (eventType == DBT_DEVICEQUERYREMOVE)
+                    {
+                        return OnDeviceQueryRemove(broadcastDevInterface->dbcc_classguid, deviceName)
+                            ? 0
+                            : BROADCAST_QUERY_DENY;
+                    }
+                    else
+                    {
+                        ThreadPool.QueueUserWorkItem(_ => DefferedDeviceEvent((DeviceBroadcastType)eventType, broadcastDevInterface->dbcc_classguid, deviceName));
+                    }
+                    break;
+                case DBT_DEVTYP_HANDLE:
+                    var broadcastHandle = (DEV_BROADCAST_HANDLE*)eventData;
+
+                    if (_fileHandleToRegistrationMappings is not null && _fileHandleToRegistrationMappings.TryGetValue(broadcastHandle->dbch_handle, out DeviceFileNotificationRegistration? registration))
+                    {
+                        if (eventType == DBT_DEVICEQUERYREMOVE)
+                        {
+                            return OnDeviceQueryRemove(registration.DeviceFileHandle, registration.UserToken)
+                                ? 0
+                                : BROADCAST_QUERY_DENY;
+                        }
+                        else
+                        {
+                            // TODO: Handle extra data for device custom events
+                            ThreadPool.QueueUserWorkItem(_ => DefferedDeviceEvent((DeviceBroadcastType)eventType, registration.DeviceFileHandle, registration.UserToken));
+                        }
+                    }
+                    break;
+                default:
+                    break;
+            }
+            return 0;
+        }
+
+        private void DefferedDeviceEvent(DeviceBroadcastType eventType, Guid interfaceClassGuid, string? deviceName)
+        {
+            try
+            {
+                OnDeviceNotification(eventType, interfaceClassGuid, deviceName);
+            }
+            catch (Exception e)
+            {
+                WriteLogEntry(SR.Format(SR.SessionChangeFailed, e), EventLogEntryType.Error);
+
+                // We rethrow the exception so that advapi32 code can report
+                // ERROR_EXCEPTION_IN_SERVICE as it would for native services.
+                throw;
+            }
+        }
+
+        private void DefferedDeviceEvent(DeviceBroadcastType eventType, SafeFileHandle safeFileHandle, object? userToken)
+        {
+            try
+            {
+                OnDeviceNotification(eventType, safeFileHandle, userToken);
+            }
+            catch (Exception e)
+            {
+                WriteLogEntry(SR.Format(SR.SessionChangeFailed, e), EventLogEntryType.Error);
 
                 // We rethrow the exception so that advapi32 code can report
                 // ERROR_EXCEPTION_IN_SERVICE as it would for native services.
@@ -726,6 +855,12 @@ namespace System.ServiceProcess
         {
             switch (command)
             {
+                case ControlOptions.CONTROL_DEVICEEVENT:
+                    {
+                        // We need to decode the event data synchronously, and at least the DBT_DEVICEQUERYREMOVE event should be treated immediately.
+                        return ImmediateDeviceEvent(eventType, eventData);
+                    }
+
                 case ControlOptions.CONTROL_POWEREVENT:
                     {
                         ThreadPool.QueueUserWorkItem(_ => DeferredPowerEvent(eventType, eventData));
@@ -966,6 +1101,165 @@ namespace System.ServiceProcess
             {
                 // Do nothing.  Not having the event log is bad, but not starting the service as a result is worse.
             }
+        }
+
+        /// <devdoc>
+        /// Register to receive device notifications for the specified file handle.
+        /// </devdoc>
+        [EditorBrowsable(EditorBrowsableState.Advanced)]
+        public unsafe IDisposable RegisterDeviceNotifications(SafeFileHandle handle, object? userToken)
+        {
+            return DeviceFileNotificationRegistration.RegisterDeviceNotifications(
+                LazyInitializer.EnsureInitialized(ref _fileHandleToRegistrationMappings),
+                ServiceHandle,
+                handle,
+                userToken);
+        }
+
+        /// <devdoc>
+        /// Register to receive device notifications for the specified device interface class.
+        /// </devdoc>
+        [EditorBrowsable(EditorBrowsableState.Advanced)]
+        public IDisposable RegisterDeviceNotifications(Guid interfaceClassGuid) => DeviceInterfaceClassNotificationRegistration.RegisterDeviceNotifications(ServiceHandle, interfaceClassGuid);
+
+        /// <devdoc>
+        /// Register to receive device notifications for all device interface classes.
+        /// </devdoc>
+        [EditorBrowsable(EditorBrowsableState.Advanced)]
+        public IDisposable RegisterDeviceNotifications() => DeviceInterfaceClassNotificationRegistration.RegisterDeviceNotifications(ServiceHandle);
+
+        // Class used to manage handle-based device registrations.
+        // It would be possible to shove everything within SafeDeviceNotificationHandle to save one object allocation, but this feels a bit cleaner.
+        internal sealed class DeviceFileNotificationRegistration : IDisposable
+        {
+            public static unsafe DeviceFileNotificationRegistration RegisterDeviceNotifications(ConcurrentDictionary<IntPtr, DeviceFileNotificationRegistration> registrationDictionary, IntPtr serviceHandle, SafeFileHandle fileHandle, object? userToken)
+            {
+                var registration = new DeviceFileNotificationRegistration(registrationDictionary, fileHandle, userToken);
+
+                bool success = false;
+                // Prevent the device file handle from being released while it is being used for notifications.
+                fileHandle.DangerousAddRef(ref success);
+
+                if (!success)
+                {
+                    throw new InvalidOperationException(SR.InvalidDeviceFileHandle);
+                }
+
+                var rawFileHandle = fileHandle.DangerousGetHandle();
+
+                // Register the current (yet not fully initialized) instance so that notifications can provide the correct UserToken.
+                registrationDictionary[rawFileHandle] = registration;
+
+                try
+                {
+                    var notificationHandle = Interop.User32.RegisterDeviceNotificationW(
+                        serviceHandle,
+                        new Interop.User32.DEV_BROADCAST_HANDLE
+                        {
+                            dbch_size = sizeof(Interop.User32.DEV_BROADCAST_HANDLE),
+                            dbch_devicetype = Interop.User32.DBT_DEVTYP_HANDLE,
+                            dbch_handle = rawFileHandle,
+                        },
+                        Interop.User32.DEVICE_NOTIFY_SERVICE_HANDLE);
+                    if (notificationHandle.IsInvalid)
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                    }
+                    registration._deviceNotificationHandle = notificationHandle;
+
+                    return registration;
+                }
+                catch
+                {
+                    registration.Dispose();
+                    throw;
+                }
+            }
+
+            private readonly ConcurrentDictionary<IntPtr, DeviceFileNotificationRegistration> _registrationDictionary;
+            private SafeDeviceNotificationHandle? _deviceNotificationHandle;
+            public SafeFileHandle DeviceFileHandle { get; }
+            private int _isDisposed;
+
+            /// <devdoc>
+            /// A user-supplied object used to track this instance.
+            /// </devdoc>
+            public object? UserToken { get; }
+
+            private DeviceFileNotificationRegistration(ConcurrentDictionary<IntPtr, DeviceFileNotificationRegistration> registrationDictionary, SafeFileHandle fileHandle, object? userToken)
+            {
+                _registrationDictionary = registrationDictionary;
+                DeviceFileHandle = fileHandle;
+                UserToken = userToken;
+            }
+
+            ~DeviceFileNotificationRegistration() => Dispose(false);
+
+            public void Dispose()
+            {
+                Dispose(true);
+                GC.SuppressFinalize(this);
+            }
+
+            private void Dispose(bool disposing)
+            {
+                if (Interlocked.CompareExchange(ref _isDisposed, 1, 0) == 0)
+                {
+                    // Whenever possible, this instance should be removed from the mapping dictionary to avoid a permanent leak.
+                    _registrationDictionary?.TryRemove(DeviceFileHandle?.DangerousGetHandle() ?? default, out _);
+
+                    if (disposing)
+                    {
+                        _deviceNotificationHandle?.Dispose();
+                    }
+                }
+            }
+        }
+
+        // Class used to manage device interface class notification registrations.
+        // These are easier to manage, as they are bound to an easily comaprable GUID and not a HANDLE.
+        internal sealed class DeviceInterfaceClassNotificationRegistration : IDisposable
+        {
+            public static unsafe DeviceInterfaceClassNotificationRegistration RegisterDeviceNotifications(IntPtr serviceHandle, Guid interfaceClassGuid)
+            {
+                var handle = RegisterDeviceNotificationW(
+                    serviceHandle,
+                    new DEV_BROADCAST_DEVICEINTERFACE
+                    {
+                        dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE),
+                        dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE,
+                        dbcc_classguid = interfaceClassGuid,
+                    },
+                    DEVICE_NOTIFY_SERVICE_HANDLE);
+                if (handle.IsInvalid)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                return new DeviceInterfaceClassNotificationRegistration(handle);
+            }
+
+            public static unsafe DeviceInterfaceClassNotificationRegistration RegisterDeviceNotifications(IntPtr serviceHandle)
+            {
+                var handle = RegisterDeviceNotificationW(
+                    serviceHandle,
+                    new DEV_BROADCAST_DEVICEINTERFACE
+                    {
+                        dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE),
+                        dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE,
+                    },
+                    DEVICE_NOTIFY_SERVICE_HANDLE | DEVICE_NOTIFY_ALL_INTERFACE_CLASSES);
+                if (handle.IsInvalid)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                return new DeviceInterfaceClassNotificationRegistration(handle);
+            }
+
+            private SafeDeviceNotificationHandle _safeDeviceNotificationHandle;
+
+            private DeviceInterfaceClassNotificationRegistration(SafeDeviceNotificationHandle safeDeviceNotificationHandle) => _safeDeviceNotificationHandle = safeDeviceNotificationHandle;
+
+            public void Dispose() => _safeDeviceNotificationHandle.Dispose();
         }
     }
 }
